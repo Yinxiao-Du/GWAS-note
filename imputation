@@ -1,0 +1,300 @@
+###数据准备————基因组版本转换
+##Convert .map to .bed file
+plink --file raw --chr-set 34 --allow-extra-chr --chr 1-22 --recode --out raw_filter
+map文件构建bed文件，excel处理，e.g. "chr4 100000 100001 rs11111"，文本格式保存，文件后缀.bed
+##LiftOver .bed file
+在线转换即可（https://genome.ucsc.edu/cgi-bin/hgLiftOver)，保存转换failed的ID
+##Modify .ped file
+plink --file raw_filter --exclude fail_flip.txt --recode --out raw_clean
+得到去除未成功转化的SNP
+##Convert lifted .bed file back to .map file
+更新map文件（根据bed文件进行更新）
+ped文件转换为二进制文件格式（.bed, .bim, .fam）
+
+
+###数据质量控制
+##样本质控（去除356、575）
+plink --file raw_clean --remove fail-qc-inds.txt --make-bed --out clean-inds-raw
+##SNP质控
+plink --bfile clean-inds-raw --maf 0.01 --geno 0.05 --hwe 0.00001 --recode --out PRI
+##去除重复position位点
+plink --file PRI --list-duplicate-vars ids-only suppress-first --out PRI_dup
+plink --file PRI --exclude PRI_dup.dupvar --recode --out PRI
+
+
+
+###根据染色体拆分plink文件
+for i in {1..22}
+do
+./plink \
+--file ./PRI/raw-data/PRI \
+--chr $i \
+--make-bed \
+--out ./PRI/raw-data/PRI_chr$i
+done
+
+
+###正负链矫正
+vim shapeit2_flip.sh
+
+#!/bin/bash
+./bin/shapeit \
+-check \
+-B /mnt/volume1/Duyinxiao/plink_1.9/PRI/raw-data/PRI_chr$1 \
+-M /mnt/volume1/Duyinxiao/genetic_map_b37/genetic_map_GRCh37_chr$1.txt \
+--input-ref /mnt/volume1/Duyinxiao/1000GP_Phase3/1000GP_Phase3_chr$1.hap.gz /mnt/volume1/Duyinxiao/1000GP_Phase3/1000GP_Phase3_chr$1.legend.gz /mnt/volume1/Duyinxiao/1000GP_Phase3/1000GP_Phase3.sample \
+--output-log ./PRI_test/results_flip/PRI_chr$1.alignments
+
+chmod +x ./shapeit2_flip.sh
+parallel ./shapeit2_flip.sh ::: {1..22}
+
+删除正负链矫正存在异常的位点
+
+###Pre-phasing
+vim shapeit2_pre_phasing.sh
+
+#!/bin/bash
+./bin/shapeit \
+--duohmm -W 5 \
+--thread 4 \
+--effective-size 14269 \
+-B /mnt/volume1/Duyinxiao/plink_1.9/PRI/goodflip/PRI_chr$1 \
+-M /mnt/volume1/Duyinxiao/1000GP_Phase3/genetic_map_chr$1_combined_b37.txt \
+-O ./PRI_test/results_pre_phasing/hapData_chr$1
+
+chmod +x ./shapeit2_pre_phasing.sh
+parallel --jobs 10 ./shapeit2_pre_phasing.sh ::: {1..22}
+
+
+###impute
+vim impute2_PRI.sh
+
+#!/bin/bash
+CHR=$1
+x=`expr $2 - 1`
+CHUNK_START=`expr $x \* 5000000`
+CHUNK_END=`expr $2 \* 5000000`
+./impute2 \
+-m /mnt/volume1/Duyinxiao/1000GP_Phase3/genetic_map_chr${CHR}_combined_b37.txt \
+-h /mnt/volume1/Duyinxiao/1000GP_Phase3/1000GP_Phase3_chr${CHR}.hap.gz \
+-l /mnt/volume1/Duyinxiao/1000GP_Phase3/1000GP_Phase3_chr${CHR}.legend.gz \
+-known_haps_g /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.haps \
+-int $CHUNK_START $CHUNK_END \
+-Ne 20000 \
+-o /mnt/volume1/Duyinxiao/impute2/PRI_test/PRI_test_chr${CHR}.${CHUNK_START}-${CHUNK_END}.phased.impute2
+
+chmod +x ./impute2_PRI.sh
+parallel --jobs 10 ./impute2_PRI.sh ::: {1..22} ::: {1..50}
+
+
+###合并impute文件（gtool）
+vim PRI_merge_1.sh
+
+#!/bin/bash
+CHR=$1
+a=`expr $2 \* 2 - 2`
+b=`expr $2 \* 2 - 1`
+c=`expr $2 \* 2`
+CHUNK_START_1=`expr $a \* 5000000`
+CHUNK_END_1=`expr $b \* 5000000`
+CHUNK_START_2=`expr $b \* 5000000`
+CHUNK_END_2=`expr $c \* 5000000`
+./gtool -M \
+--g /mnt/volume1/Duyinxiao/impute2/PRI_test/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_1}.phased.impute2 /mnt/volume1/Duyinxiao/impute2/PRI_test/PRI_test_chr${CHR}.${CHUNK_START_2}-${CHUNK_END_2}.phased.impute2 \
+--s /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample \
+--og ./PRI_test/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_2}.phased.impute2 \
+--os ./PRI_test/hapData_chr${CHR}.sample
+
+chmod +x ./PRI_merge_1.sh
+parallel ./PRI_merge_1.sh ::: {1..22} ::: {1..25}
+
+vim PRI_merge_2.sh
+
+#!/bin/bash
+CHR=$1
+a=`expr $2 \* 2 - 2`
+b=`expr $2 \* 2 - 1`
+c=`expr $2 \* 2`
+CHUNK_START_1=`expr $a \* 10000000`
+CHUNK_END_1=`expr $b \* 10000000`
+CHUNK_START_2=`expr $b \* 10000000`
+CHUNK_END_2=`expr $c \* 10000000`
+./gtool -M \
+--g /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_1}.phased.impute2 /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI_test_chr${CHR}.${CHUNK_START_2}-${CHUNK_END_2}.phased.impute2 \
+--s /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample \
+--og ./PRI_test/PRI/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_2}.phased.impute2 \
+--os ./PRI_test/PRI/hapData_chr${CHR}.sample
+
+chmod +x ./PRI_merge_2.sh
+parallel ./PRI_merge_2.sh ::: {1..22} ::: {1..13}
+
+vim PRI_merge_3.sh
+
+#!/bin/bash
+CHR=$1
+a=`expr $2 \* 2 - 2`
+b=`expr $2 \* 2 - 1`
+c=`expr $2 \* 2`
+CHUNK_START_1=`expr $a \* 20000000`
+CHUNK_END_1=`expr $b \* 20000000`
+CHUNK_START_2=`expr $b \* 20000000`
+CHUNK_END_2=`expr $c \* 20000000`
+./gtool -M \
+--g /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_1}.phased.impute2 /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI/PRI_test_chr${CHR}.${CHUNK_START_2}-${CHUNK_END_2}.phased.impute2 \
+--s /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample \
+--og ./PRI_test/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_2}.phased.impute2 \
+--os ./PRI_test/hapData_chr${CHR}.sample
+
+chmod +x ./PRI_merge_3.sh
+parallel ./PRI_merge_3.sh ::: {1..22} ::: {1..7}
+
+vim PRI_merge_4.sh
+
+#!/bin/bash
+CHR=$1
+a=`expr $2 \* 2 - 2`
+b=`expr $2 \* 2 - 1`
+c=`expr $2 \* 2`
+CHUNK_START_1=`expr $a \* 40000000`
+CHUNK_END_1=`expr $b \* 40000000`
+CHUNK_START_2=`expr $b \* 40000000`
+CHUNK_END_2=`expr $c \* 40000000`
+./gtool -M \
+--g /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_1}.phased.impute2 /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI_test_chr${CHR}.${CHUNK_START_2}-${CHUNK_END_2}.phased.impute2 \
+--s /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample \
+--og ./PRI_test/PRI/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_2}.phased.impute2 \
+--os ./PRI_test/PRI/hapData_chr${CHR}.sample
+
+chmod +x ./PRI_merge_4.sh
+parallel ./PRI_merge_4.sh ::: {1..22} ::: {1..4}
+
+vim PRI_merge_5.sh
+
+#!/bin/bash
+CHR=$1
+a=`expr $2 \* 2 - 2`
+b=`expr $2 \* 2 - 1`
+c=`expr $2 \* 2`
+CHUNK_START_1=`expr $a \* 80000000`
+CHUNK_END_1=`expr $b \* 80000000`
+CHUNK_START_2=`expr $b \* 80000000`
+CHUNK_END_2=`expr $c \* 80000000`
+./gtool -M \
+--g /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_1}.phased.impute2 /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI/PRI_test_chr${CHR}.${CHUNK_START_2}-${CHUNK_END_2}.phased.impute2 \
+--s /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample \
+--og ./PRI_test/PRI_test_chr${CHR}.${CHUNK_START_1}-${CHUNK_END_2}.phased.impute2 \
+--os ./PRI_test/hapData_chr${CHR}.sample
+
+chmod +x ./PRI_merge_5.sh
+parallel ./PRI_merge_5.sh ::: {1..22} ::: {1..2}
+
+vim PRI_merge_6.sh
+
+#!/bin/bash
+CHR=$1
+./gtool -M \
+--g /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI_test_chr${CHR}.0-160000000.phased.impute2 /mnt/volume1/Duyinxiao/gtool/PRI_test/PRI_test_chr${CHR}.160000000-320000000.phased.impute2 \
+--s /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample /mnt/volume1/Duyinxiao/shapeit2/PRI_test/results_pre_phasing/hapData_chr${CHR}.sample \
+--og ./PRI_test/PRI/PRI_test_chr${CHR}.phased.impute2 \
+--os ./PRI_test/PRI/hapData_chr${CHR}.sample
+
+chmod +x ./PRI_merge_6.sh
+parallel ./PRI_merge_6.sh ::: {1..22}
+
+
+####impute文件转plink文件
+vim PRI_convert.sh
+
+#!/bin/bash
+CHR=$1
+./gtool -G \
+--g ./PRI_test/PRI/PRI_test_chr${CHR}.phased.impute2 \
+--s ./PRI_test/PRI/hapData_chr${CHR}.sample \
+--ped /mnt/volume1/Duyinxiao/plink_1.9/PRI/PRI_test/PRI_test_chr${CHR}.phased.ped \
+--map /mnt/volume1/Duyinxiao/plink_1.9/PRI/PRI_test/PRI_test_chr${CHR}.phased.map
+
+chmod +x ./PRI_convert.sh
+parallel ./PRI_convert.sh ::: {1..22}
+
+
+####map文件添加染色体信息
+for i in {1..22}
+do
+chr=$i
+awk -v chr=$chr '{$1=chr;print$0}' /mnt/volume1/Duyinxiao/plink_1.9/PRI/PRI_test/PRI_test_chr$chr.phased.map > /mnt/volume1/Duyinxiao/plink_1.9/PRI/PRI_test/map/PRI_test_chr$chr.phased.map
+done
+
+
+####plink文件合并
+/mnt/volume1/Duyinxiao/plink_1.9/plink \
+--file ./PRI_test_chr1.phased \
+--merge-list ./merge_list.txt \
+--make-bed \
+--out ./PRI_impute
+
+
+####plink GWAS分析
+###发现fam文件中FID与IID顺序错误，可能的原因在于进行pre-phasing，但是具体原因不明，可通过awk更改fam文件前两列顺序解决
+awk ' { t = $1; $1 = $2; $2 = t; print; } ' /mnt/volume1/Duyinxiao/plink_1.9/PRI/PRI_analysis/PRI_impute.fam > /mnt/volume1/Duyinxiao/plink_1.9/PRI/PRI_analysis/PRI_impute_2.fam
+
+
+###SNP质控
+./plink \
+--bfile ./PRI/PRI_analysis/PRI_impute \
+--maf 0.01 \
+--geno 0.05 \
+--hwe 0.00001 \
+--make-bed \
+--out ./PRI/PRI_analysis/PRI_impute_clean
+
+
+###添加表型—————case-control
+./plink \
+--bfile ./PRI/PRI_analysis/PRI_impute_clean \
+--make-pheno ./PRI/PRI_analysis/pheno_case.txt '*' \
+--make-bed \
+--out ./PRI/PRI_analysis/PRI_impute_pheno
+
+
+###case-control analysis
+./plink \
+--bfile ./PRI/PRI_analysis/PRI_impute_pheno \
+--allow-no-sex \
+--assoc \
+--out ./PRI/PRI_analysis/PRI_case_control
+
+###添加表型—————Quantitative trait
+./plink \
+--bfile ./PRI/PRI_analysis/PRI_impute_clean \
+--pheno ./PRI/PRI_analysis/pheno_pri.txt \
+--make-bed \
+--out ./PRI/PRI_analysis/PRI_impute_pheno_pri
+
+###Quantitative trait analysis
+./plink \
+--bfile ./PRI/PRI_analysis/PRI_impute_pheno_pri \
+--allow-no-sex \
+--assoc \
+--out ./PRI/PRI_analysis/PRI_pheno_pri
+
+
+###manhattan图
+tiff(file="PRI_qassco.tiff", res = 600, width=8000, height=4000)
+manhattan(PRI_qassco, cex = 0.6, cex.axis = 0.9, suggestiveline = F, genomewideline = 4, col = c("blue4", "orange3"))
+dev.off()
+
+tiff(file="PRI_qassco.tiff", res = 600, width=8000, height=4000)
+manhattan(PRI_qassco, cex = 0.6, cex.axis = 0.9, suggestiveline = F, genomewideline = 4, col = c("blue4", "orange3"))
+dev.off()
+
+qassoc_PSMA2 <- filter(PRI_qassco, CHR == 7, BP < 44000000, BP > 41000000)
+write.table(qassoc_PSMA2, "qassoc_PSMA2.qassoc", sep = "\t", 
+            row.names = FALSE, quote = FALSE)
+rename_snps <- fread("/mnt/volume1/Duyinxiao/reference_data/rename_snps.txt", header = F)
+
+PRI_assoc_1 <- filter(PRI_assco, CHR == 1)
+PRI_assoc_1$CHR_name <- sub("^", "chr", PRI_assoc_1$CHR)
+colnames(rename_snps) <- c("A", "CHR_name", "B", "BP", "RSID")
+merge <- merge(PRI_assoc_1, rename_snps, by = c("CHR_name", "BP"), all.x=TRUE)
+data_assoc_chr1 <- merge[,c("CHR", "BP", "RSID", "P")]
+write.table(data_assoc_chr1, "data_assoc_chr1.assoc", quote = FALSE, sep = "\t", row.names = FALSE)
